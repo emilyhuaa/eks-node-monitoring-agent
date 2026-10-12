@@ -172,3 +172,29 @@ func TestSystemdDBusTransport_UnexpectedTypeIsUnknown(t *testing.T) {
 		t.Errorf("detail %q should name the type and value it got", result.Detail)
 	}
 }
+
+func TestSystemdDBusTransport_UnknownWhen(t *testing.T) {
+	for _, tc := range []struct {
+		subState string
+		want     Outcome
+	}{
+		{"start", OutcomeUnknown},
+		{"auto-restart", OutcomeUnhealthy},
+	} {
+		t.Run(tc.subState, func(t *testing.T) {
+			conn := &fakeDBusConn{
+				unitProps:    map[string]any{"ActiveState": "activating", "LoadState": "loaded", "SubState": tc.subState},
+				serviceProps: map[string]any{"Result": "success"},
+			}
+			check := dbusCheck()
+			check.UnknownWhen = map[string][]string{"SubState": {"start"}}
+			result := dbusTransport(conn, nil).Do(context.Background(), check)
+			if result.Outcome != tc.want {
+				t.Errorf("outcome = %q (%s), want %q", result.Outcome, result.Detail, tc.want)
+			}
+			if !strings.Contains(result.Detail, `SubState="`+tc.subState+`"`) {
+				t.Errorf("detail %q should name the SubState", result.Detail)
+			}
+		})
+	}
+}

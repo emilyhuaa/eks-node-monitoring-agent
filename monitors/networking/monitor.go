@@ -268,14 +268,12 @@ func (m *NetworkingMonitor) Register(ctx context.Context, mgr monitor.Manager) e
 		).Start(ctx)
 	}
 
-	// Corefile agent /readyz polling on Auto Mode nodes that have the agent.
-	// Short cadence because the outcome changes on a ConfigMap edit.
 	if slices.Contains(m.runtimeContext.Tags(), config.EKSAuto) && corefile.AgentInstalled(ctx, m.log) {
-		corefileDetector := corefile.New(mgr, m.log)
-		go util.NewChannelHandler(
-			func(time.Time) error { return corefileDetector.HandleState() },
-			util.TimeTickWithJitterContext(ctx, 30*time.Second),
-		).Start(ctx)
+		corefileProbe, err := probe.NewRunner(corefile.Spec(), mgr, m.log)
+		if err != nil {
+			return err
+		}
+		go corefileProbe.Start(ctx)
 	}
 
 	// EFA hardware counter monitoring

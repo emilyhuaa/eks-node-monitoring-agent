@@ -21,8 +21,10 @@ import (
 // condition flapping, and a one-shot summary of failure episodes that
 // recover before reaching the failure threshold. Each check keeps its own
 // state and reports under its own reason and severity, and a failure is
-// reported once per episode. Unknown results (checks that could not execute
-// for monitoring-side reasons) never count toward either threshold.
+// reported once per episode. A Warning or Info failure can be re-sent while it
+// persists, every ReNotifyInterval or when its change key changes. Unknown
+// results (checks that could not execute for monitoring-side reasons, or
+// states the check names as unknown) never count toward either threshold.
 type Runner struct {
 	spec       probe.Spec
 	transports map[probe.TransportKind]Transport
@@ -55,8 +57,13 @@ type checkState struct {
 	// one while a fired failure awaits resolution.
 	consecutiveHealthy int
 	// fired records that this episode's failure was reported. It is not
-	// reported again until the check recovers.
+	// reported again until the check recovers, unless it is due for a
+	// re-notify (see reNotifyDue).
 	fired bool
+	// lastNotified and lastChangeKey are when this episode's failure was
+	// last reported, and the change key it was reported with.
+	lastNotified  time.Time
+	lastChangeKey string
 	// streakStart is the cycle time of the current streak's first failure.
 	streakStart time.Time
 	// streakStartedInGrace records whether the current failure streak began
@@ -98,19 +105,23 @@ func NewRunner(spec probe.Spec, mgr monitor.Manager, log logr.Logger) (*Runner, 
 
 // newCheckState returns the initial state for a validated check.
 func newCheckState(name string, check probe.Check) *checkState {
-	severity := check.FailureSeverity
-	if severity == "" {
-		// Validate guarantees the reason is registered.
-		meta, _ := reasons.ByName(check.ReasonOnFail)
-		severity = meta.DefaultSeverity()
+	return &checkState{name: name, check: check, reason: check.ReasonOnFail, severity: failureSeverity(check)}
+}
+
+// failureSeverity is the check's own failure severity, or its reason's default
+// severity when it does not set one. The reason must be registered.
+func failureSeverity(check probe.Check) monitor.Severity {
+	if check.FailureSeverity != "" {
+		return check.FailureSeverity
 	}
-	return &checkState{name: name, check: check, reason: check.ReasonOnFail, severity: severity}
+	meta, _ := reasons.ByName(check.ReasonOnFail)
+	return meta.DefaultSeverity()
 }
 
 // Start runs the probe loop until the context is canceled.
 func (r *Runner) Start(ctx context.Context) error {
 	r.startedAt = r.now()
-	r.log.Info("starting probe", "interval", r.spec.Interval.Duration, "failureThreshold", r.spec.FailureThreshold, "startupGracePeriod", r.spec.StartupGracePeriod.Duration)
+	r.log.Info("starting probe", "interval", r.spec.Interval.Duration, "failureThreshold", r.spec.FailureThreshold, "startupGracePeriod", r.spec.StartupGracePeriod.Duration, "reNotifyInterval", r.spec.ReNotifyInterval.Duration)
 	ticks := r.newTicker(ctx, r.spec.Interval.Duration)
 	for {
 		select {
@@ -143,10 +154,10 @@ func (r *Runner) runOnce(ctx context.Context) error {
 func (r *Runner) apply(ctx context.Context, cs *checkState, result Result, now time.Time) error {
 	switch result.Outcome {
 	case OutcomeUnknown:
-		// The check could not execute; this is not evidence about the agent
-		// in either direction. Leave the failure and recovery counters
-		// untouched.
-		r.log.Info("probe check could not execute, skipping", "check", cs.name, "detail", result.Detail)
+		// The check could not execute, or the agent reported a state its
+		// UnknownWhen names; this is not evidence about the agent in either
+		// direction. Leave the failure and recovery counters untouched.
+		r.log.Info("probe check result is unknown, skipping", "check", cs.name, "detail", result.Detail)
 		return nil
 	case OutcomeHealthy:
 		return r.applyHealthy(ctx, cs, now)
@@ -215,6 +226,8 @@ func (r *Runner) applyUnhealthy(ctx context.Context, cs *checkState, result Resu
 	// healthy results.
 	cs.consecutiveHealthy = 0
 	switch {
+	case cs.fired && r.reNotifyDue(cs, result, now):
+		r.log.Info("probe still failing, re-notifying", "check", cs.name, "detail", result.Detail, "consecutiveFailures", cs.consecutiveFailures)
 	case cs.fired:
 		// Already reported in this episode. Re-sending would patch the node
 		// (Fatal) or record an event (Warning, Info) every round; the
@@ -228,12 +241,32 @@ func (r *Runner) applyUnhealthy(ctx context.Context, cs *checkState, result Resu
 		r.log.Info("probe failing below threshold", "check", cs.name, "detail", result.Detail, "consecutiveFailures", cs.consecutiveFailures)
 		return nil
 	}
+	// A result without a change key, such as a refused connection, keeps
+	// the key of the failure it interrupted.
+	if !cs.fired || result.ChangeKey != "" {
+		cs.lastChangeKey = result.ChangeKey
+	}
 	cs.fired = true
+	cs.lastNotified = now
 	return r.manager.Notify(ctx, monitor.Condition{
 		Reason:   cs.reason,
 		Message:  result.Detail,
 		Severity: cs.severity,
 	})
+}
+
+// reNotifyDue reports whether a fired Warning or Info failure should be sent
+// again: its change key changed, or the spec's re-notify interval has passed.
+// A Fatal failure keeps its condition set and is never re-sent.
+func (r *Runner) reNotifyDue(cs *checkState, result Result, now time.Time) bool {
+	if cs.severity == monitor.SeverityFatal {
+		return false
+	}
+	if len(cs.check.ReNotifyOnChange) > 0 && result.ChangeKey != "" && result.ChangeKey != cs.lastChangeKey {
+		return true
+	}
+	interval := r.spec.ReNotifyInterval.Duration
+	return interval > 0 && now.Sub(cs.lastNotified) >= interval
 }
 
 // do executes a single check via its transport and prefixes the detail with

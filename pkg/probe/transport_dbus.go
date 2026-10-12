@@ -14,6 +14,10 @@ import (
 // bus through the last property read.
 const dbusCheckTimeout = 5 * time.Second
 
+// unitStates are the unit properties a systemd-dbus check reads, and so the
+// names its UnknownWhen can use.
+var unitStates = []string{"ActiveState", "LoadState", "SubState", "Result"}
+
 // dbusConn is the subset of the go-systemd dbus connection used by the
 // transport, extracted so tests can substitute a fake.
 type dbusConn interface {
@@ -75,6 +79,7 @@ func (t *SystemdDBusTransport) Do(ctx context.Context, check probe.Check) Result
 	// Best-effort diagnostic enrichment: why/how the unit is in its state.
 	// Result is defined on systemd's Service interface, not the Unit
 	// interface; validation guarantees the unit is a service.
+	states := map[string]string{"ActiveState": activeState}
 	detail := fmt.Sprintf("unit %s ActiveState=%q", check.Address, activeState)
 	for _, prop := range []struct {
 		name string
@@ -86,9 +91,13 @@ func (t *SystemdDBusTransport) Do(ctx context.Context, check probe.Check) Result
 	} {
 		if p, err := prop.get(ctx, check.Address, prop.name); err == nil {
 			if s, ok := p.Value.Value().(string); ok {
+				states[prop.name] = s
 				detail += fmt.Sprintf(" %s=%q", prop.name, s)
 			}
 		}
+	}
+	if matchesUnknownWhen(check.UnknownWhen, func(name string) string { return states[name] }) {
+		return Result{Outcome: OutcomeUnknown, Detail: detail}
 	}
 	return Result{Outcome: OutcomeUnhealthy, Detail: detail}
 }

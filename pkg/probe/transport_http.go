@@ -2,11 +2,13 @@ package probe
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/eks-node-monitoring-agent/api/probe"
 )
@@ -18,6 +20,10 @@ const (
 	// result detail for condition messages. A longer body is cut off and
 	// marked as truncated.
 	maxDetailBytes = 1024
+	// maxBodyBytes bounds how much of a response body is read. It is larger
+	// than maxDetailBytes so a body can be parsed for its report fields
+	// before the detail is cut off.
+	maxBodyBytes = 64 << 10
 )
 
 // HTTPLoopbackTransport executes checks as HTTP GET requests against
@@ -65,18 +71,69 @@ func (t *HTTPLoopbackTransport) Do(ctx context.Context, check probe.Check) Resul
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return Result{Outcome: OutcomeHealthy}
 	}
-	// Read one byte past the limit to tell whether the body was cut off.
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxDetailBytes+1))
-	truncated := len(body) > maxDetailBytes
-	if truncated {
-		body = body[:maxDetailBytes]
-	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	object := jsonObject(body)
 	detail := fmt.Sprintf("GET %s: %s", url, resp.Status)
-	if b := strings.TrimSpace(string(body)); b != "" {
+	if b := bodyDetail(body, object, check.ReportFields); b != "" {
 		detail += ": " + b
-		if truncated {
-			detail += " (truncated)"
+	}
+	outcome := OutcomeUnhealthy
+	if matchesUnknownWhen(check.UnknownWhen, func(name string) string { return fieldText(object[name]) }) {
+		outcome = OutcomeUnknown
+	}
+	return Result{Outcome: outcome, Detail: detail, ChangeKey: renderFields(object, check.ReNotifyOnChange)}
+}
+
+// jsonObject parses a body as a JSON object, or returns nil if it is not one.
+func jsonObject(body []byte) map[string]json.RawMessage {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(body, &object) != nil {
+		return nil
+	}
+	return object
+}
+
+// bodyDetail renders a response body for a failure detail: the report fields
+// when they are set and present in the body, and the raw body otherwise.
+func bodyDetail(body []byte, object map[string]json.RawMessage, fields []string) string {
+	text := renderFields(object, fields)
+	if text == "" {
+		text = strings.TrimSpace(string(body))
+	}
+	return truncateDetail(text)
+}
+
+// renderFields renders the named top-level fields of a JSON object as
+// "name=value" pairs. A string value is written as is and any other value as
+// its JSON text.
+func renderFields(object map[string]json.RawMessage, fields []string) string {
+	var pairs []string
+	for _, name := range fields {
+		if value := fieldText(object[name]); value != "" {
+			pairs = append(pairs, name+"="+value)
 		}
 	}
-	return Result{Outcome: OutcomeUnhealthy, Detail: detail}
+	return strings.Join(pairs, ", ")
+}
+
+// fieldText renders one JSON value. A missing or null value renders empty.
+func fieldText(raw json.RawMessage) string {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return string(raw)
+}
+
+// truncateDetail cuts text to maxDetailBytes on a rune boundary and marks it
+// as truncated.
+func truncateDetail(text string) string {
+	if len(text) <= maxDetailBytes {
+		return text
+	}
+	cut := maxDetailBytes
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + " (truncated)"
 }

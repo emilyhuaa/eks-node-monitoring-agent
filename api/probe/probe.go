@@ -63,6 +63,13 @@ type Spec struct {
 	// the runner starts, tolerating agents that come up after the monitoring
 	// agent during boot.
 	StartupGracePeriod metav1.Duration `json:"startupGracePeriod,omitempty"`
+
+	// ReNotifyInterval re-sends a Warning or Info failure that is still
+	// failing once this long has passed since it was last sent, so its event
+	// does not age out while the failure persists. If zero, a failure is sent
+	// once per episode. A Fatal failure keeps its condition and is not
+	// re-sent.
+	ReNotifyInterval metav1.Duration `json:"reNotifyInterval,omitempty"`
 }
 
 // Checks defines the individual checks that make up a probe. Liveness is
@@ -106,4 +113,28 @@ type Check struct {
 	// check fails. If empty, the reason's default severity from reasons.yaml
 	// is used.
 	FailureSeverity monitor.Severity `json:"failureSeverity,omitempty"`
+
+	// ReportFields names the top-level fields of a JSON response body to
+	// report, in order, instead of the raw body, e.g. ["reason", "detail"].
+	// It keeps volatile fields such as timestamps out of the failure detail.
+	// A field that is missing, null, or an empty string is left out. A body
+	// that is not a JSON object, or has none of the fields, is reported raw.
+	// http-loopback only.
+	ReportFields []string `json:"reportFields,omitempty"`
+
+	// ReNotifyOnChange names report fields whose values identify a failure.
+	// A failure that is still failing is sent again when any of them
+	// changes, so a new failure is reported without waiting for the check to
+	// recover. Each must also be in ReportFields, so the new event shows the
+	// change. Warning and Info checks only: a Fatal check holds one condition
+	// for the whole episode.
+	ReNotifyOnChange []string `json:"reNotifyOnChange,omitempty"`
+
+	// UnknownWhen makes a result Unknown instead of Unhealthy when a named
+	// value has one of the listed strings. An Unknown result neither counts
+	// toward a threshold nor fires. For http-loopback the names are
+	// top-level fields of a non-2xx JSON response body, e.g.
+	// {"reason": ["Initializing"]}. For systemd-dbus they are the unit's
+	// ActiveState, LoadState, SubState, or Result when it is not active.
+	UnknownWhen map[string][]string `json:"unknownWhen,omitempty"`
 }

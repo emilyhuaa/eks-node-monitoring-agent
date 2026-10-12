@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"slices"
 
 	"github.com/aws/eks-node-monitoring-agent/api/probe"
 )
@@ -17,7 +18,8 @@ const (
 	// an agent that is not answering its health surface is not healthy.
 	OutcomeUnhealthy Outcome = "Unhealthy"
 	// OutcomeUnknown means the check could not be executed for reasons on the
-	// monitoring side (e.g. the D-Bus socket is unreachable). Unknown results
+	// monitoring side (e.g. the D-Bus socket is unreachable), or the agent
+	// answered with a state the check's UnknownWhen names. Unknown results
 	// do not count toward a probe's failure threshold.
 	OutcomeUnknown Outcome = "Unknown"
 )
@@ -27,6 +29,9 @@ const (
 type Result struct {
 	Outcome Outcome
 	Detail  string
+	// ChangeKey identifies an unhealthy result for the check's
+	// ReNotifyOnChange: the values of those fields.
+	ChangeKey string
 }
 
 // Transport executes a single check against its target.
@@ -40,4 +45,15 @@ func NewTransports() map[probe.TransportKind]Transport {
 		probe.TransportHTTPLoopback: NewHTTPLoopbackTransport(),
 		probe.TransportSystemdDBus:  NewSystemdDBusTransport(),
 	}
+}
+
+// matchesUnknownWhen reports whether any value named in unknownWhen is one of
+// its listed strings. value returns the named value, or "" when it is absent.
+func matchesUnknownWhen(unknownWhen map[string][]string, value func(name string) string) bool {
+	for name, values := range unknownWhen {
+		if slices.Contains(values, value(name)) {
+			return true
+		}
+	}
+	return false
 }

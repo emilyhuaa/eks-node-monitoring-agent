@@ -216,7 +216,7 @@ func TestValidate(t *testing.T) {
 			mutate: func(s *probe.Spec) {
 				s.Checks.Diagnostics = &probe.Check{Transport: probe.TransportHTTPLoopback, Address: "127.0.0.1:8173", Path: "/diagnostics", ReasonOnFail: "IPAMDNotReady"}
 			},
-			wantErr: "cannot set reasonOnFail or failureSeverity",
+			wantErr: "cannot set reasonOnFail, failureSeverity, or reNotifyOnChange",
 		},
 		{
 			name: "diagnostics cannot use systemd-dbus",
@@ -224,6 +224,126 @@ func TestValidate(t *testing.T) {
 				s.Checks.Diagnostics = &probe.Check{Transport: probe.TransportSystemdDBus, Address: "ipamd.service"}
 			},
 			wantErr: "only the liveness check can use it",
+		},
+		{
+			name: "diagnostics cannot re-notify on change",
+			mutate: func(s *probe.Spec) {
+				s.Checks.Diagnostics = &probe.Check{Transport: probe.TransportHTTPLoopback, Address: "127.0.0.1:8173", Path: "/diagnostics",
+					ReportFields: []string{"reason"}, ReNotifyOnChange: []string{"reason"}}
+			},
+			wantErr: "cannot set reasonOnFail, failureSeverity, or reNotifyOnChange",
+		},
+		{
+			name: "http-loopback Warning check can report fields, re-notify on change, and name unknown values",
+			mutate: func(s *probe.Spec) {
+				s.Checks.Readiness = &probe.Check{Transport: probe.TransportHTTPLoopback, Address: "127.0.0.1:8173", Path: "/readyz", ReasonOnFail: "IPAMDNotReady",
+					FailureSeverity: monitor.SeverityWarning, ReportFields: []string{"reason", "detail"}, ReNotifyOnChange: []string{"reason"},
+					UnknownWhen: map[string][]string{"reason": {"Initializing"}}}
+			},
+		},
+		{
+			name:    "reportFields needs http-loopback",
+			mutate:  func(s *probe.Spec) { s.Checks.Liveness.ReportFields = []string{"reason"} },
+			wantErr: "reportFields and reNotifyOnChange need an http-loopback check",
+		},
+		{
+			name:    "reNotifyOnChange needs http-loopback",
+			mutate:  func(s *probe.Spec) { s.Checks.Liveness.ReNotifyOnChange = []string{"reason"} },
+			wantErr: "reportFields and reNotifyOnChange need an http-loopback check",
+		},
+		{
+			name: "reportFields rejects an empty name",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.ReportFields = []string{"reason", ""}
+			},
+			wantErr: "reportFields has an empty field name",
+		},
+		{
+			name: "reportFields rejects a repeated name",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.ReportFields = []string{"reason", "detail", "reason"}
+			},
+			wantErr: `reportFields names "reason" more than once`,
+		},
+		{
+			name: "reNotifyOnChange rejects a repeated name",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.FailureSeverity = monitor.SeverityWarning
+				s.Checks.Liveness.ReportFields = []string{"reason"}
+				s.Checks.Liveness.ReNotifyOnChange = []string{"reason", "reason"}
+			},
+			wantErr: `reNotifyOnChange names "reason" more than once`,
+		},
+		{
+			name: "reNotifyOnChange fields must be reported",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.FailureSeverity = monitor.SeverityWarning
+				s.Checks.Liveness.ReportFields = []string{"reason"}
+				s.Checks.Liveness.ReNotifyOnChange = []string{"reason", "failedSha"}
+			},
+			wantErr: `reNotifyOnChange field "failedSha" is not in reportFields`,
+		},
+		{
+			name: "reNotifyOnChange rejects a Fatal check",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.FailureSeverity = monitor.SeverityFatal
+				reNotifyOnChange(&s.Checks.Liveness)
+			},
+			wantErr: "reNotifyOnChange needs a Warning or Info check",
+		},
+		{
+			name: "reNotifyOnChange rejects a check whose reason defaults to Fatal",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				reNotifyOnChange(&s.Checks.Liveness)
+			},
+			wantErr: "reNotifyOnChange needs a Warning or Info check",
+		},
+		{
+			name: "reNotifyOnChange accepts an Info check",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.FailureSeverity = monitor.SeverityInfo
+				reNotifyOnChange(&s.Checks.Liveness)
+			},
+		},
+		{
+			name:   "systemd-dbus unknownWhen can name a unit state",
+			mutate: func(s *probe.Spec) { s.Checks.Liveness.UnknownWhen = map[string][]string{"SubState": {"start"}} },
+		},
+		{
+			name:    "systemd-dbus unknownWhen rejects a name it does not read",
+			mutate:  func(s *probe.Spec) { s.Checks.Liveness.UnknownWhen = map[string][]string{"MainPID": {"0"}} },
+			wantErr: `unknownWhen name "MainPID" is not one of the unit states`,
+		},
+		{
+			name: "unknownWhen rejects an empty name",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.UnknownWhen = map[string][]string{"": {"Initializing"}}
+			},
+			wantErr: "unknownWhen has an empty name",
+		},
+		{
+			name: "unknownWhen rejects a name with no values",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.UnknownWhen = map[string][]string{"reason": nil}
+			},
+			wantErr: `unknownWhen "reason" needs at least one value`,
+		},
+		{
+			name: "unknownWhen rejects an empty value",
+			mutate: func(s *probe.Spec) {
+				httpLiveness("127.0.0.1:8173")(s)
+				s.Checks.Liveness.UnknownWhen = map[string][]string{"reason": {"Initializing", ""}}
+			},
+			wantErr: `unknownWhen "reason" needs at least one value and no empty ones`,
 		},
 		{
 			name:    "zero interval",
@@ -243,6 +363,23 @@ func TestValidate(t *testing.T) {
 			name:    "negative recovery threshold",
 			mutate:  func(s *probe.Spec) { s.RecoveryThreshold = -1 },
 			wantErr: "recoveryThreshold must not be negative",
+		},
+		{
+			name:    "negative re-notify interval",
+			mutate:  func(s *probe.Spec) { s.ReNotifyInterval = metav1.Duration{Duration: -time.Second} },
+			wantErr: "reNotifyInterval must not be negative",
+		},
+		{
+			name:    "re-notify interval with only Fatal checks",
+			mutate:  func(s *probe.Spec) { s.ReNotifyInterval = metav1.Duration{Duration: time.Minute} },
+			wantErr: "reNotifyInterval only re-sends Warning and Info failures",
+		},
+		{
+			name: "re-notify interval with a Warning check",
+			mutate: func(s *probe.Spec) {
+				s.Checks.Liveness.FailureSeverity = monitor.SeverityWarning
+				s.ReNotifyInterval = metav1.Duration{Duration: time.Minute}
+			},
 		},
 		{
 			name:    "negative grace period",

@@ -7,6 +7,7 @@ package probe
 import (
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -46,7 +47,21 @@ func Validate(spec probe.Spec) error {
 	if spec.StartupGracePeriod.Duration < 0 {
 		return fmt.Errorf("probe %q: startupGracePeriod must not be negative, got %v", spec.Subsystem, spec.StartupGracePeriod.Duration)
 	}
+	if spec.ReNotifyInterval.Duration < 0 {
+		return fmt.Errorf("probe %q: reNotifyInterval must not be negative, got %v", spec.Subsystem, spec.ReNotifyInterval.Duration)
+	}
+	if spec.ReNotifyInterval.Duration > 0 && allFatal(spec.Checks) {
+		return fmt.Errorf("probe %q: reNotifyInterval only re-sends Warning and Info failures, and every check is Fatal", spec.Subsystem)
+	}
 	return nil
+}
+
+// allFatal reports whether every check that can fail is Fatal.
+func allFatal(checks probe.Checks) bool {
+	if failureSeverity(checks.Liveness) != monitor.SeverityFatal {
+		return false
+	}
+	return checks.Readiness == nil || failureSeverity(*checks.Readiness) == monitor.SeverityFatal
 }
 
 // validateChecks validates each check in the spec. Liveness and readiness
@@ -74,8 +89,8 @@ func validateChecks(checks probe.Checks) error {
 		if err := validateCheck(diagnosticsCheck, *diagnostics); err != nil {
 			return err
 		}
-		if diagnostics.ReasonOnFail != "" || diagnostics.FailureSeverity != "" {
-			return fmt.Errorf("diagnostics check has no pass or fail, so it cannot set reasonOnFail or failureSeverity")
+		if diagnostics.ReasonOnFail != "" || diagnostics.FailureSeverity != "" || len(diagnostics.ReNotifyOnChange) > 0 {
+			return fmt.Errorf("diagnostics check has no pass or fail, so it cannot set reasonOnFail, failureSeverity, or reNotifyOnChange")
 		}
 	}
 	return nil
@@ -109,6 +124,63 @@ func validateCheck(name string, c probe.Check) error {
 		}
 	default:
 		return fmt.Errorf("%s check: unknown transport %q", name, c.Transport)
+	}
+	if err := validateResultOptions(c); err != nil {
+		return fmt.Errorf("%s check: %w", name, err)
+	}
+	return nil
+}
+
+// validateResultOptions validates the options that name parts of a check's
+// result. Report and change fields need a response body, which only
+// http-loopback reads, and each change field must also be reported.
+func validateResultOptions(c probe.Check) error {
+	if c.Transport != probe.TransportHTTPLoopback && (len(c.ReportFields) > 0 || len(c.ReNotifyOnChange) > 0) {
+		return fmt.Errorf("reportFields and reNotifyOnChange need an http-loopback check, the only transport that reads a response body")
+	}
+	if err := validateFieldNames("reportFields", c.ReportFields); err != nil {
+		return err
+	}
+	if err := validateFieldNames("reNotifyOnChange", c.ReNotifyOnChange); err != nil {
+		return err
+	}
+	for _, field := range c.ReNotifyOnChange {
+		if !slices.Contains(c.ReportFields, field) {
+			return fmt.Errorf("reNotifyOnChange field %q is not in reportFields, so a re-sent event would not show the change", field)
+		}
+	}
+	return validateUnknownWhen(c)
+}
+
+// validateFieldNames requires distinct, non-empty names.
+func validateFieldNames(option string, names []string) error {
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if name == "" {
+			return fmt.Errorf("%s has an empty field name", option)
+		}
+		if seen[name] {
+			return fmt.Errorf("%s names %q more than once", option, name)
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+// validateUnknownWhen requires non-empty values, since an empty one would
+// match every answer that lacks the name, and limits a systemd-dbus check to
+// the unit states it reads.
+func validateUnknownWhen(c probe.Check) error {
+	for name, values := range c.UnknownWhen {
+		if name == "" {
+			return fmt.Errorf("unknownWhen has an empty name")
+		}
+		if c.Transport == probe.TransportSystemdDBus && !slices.Contains(unitStates, name) {
+			return fmt.Errorf("unknownWhen name %q is not one of the unit states a systemd-dbus check reads: %s", name, strings.Join(unitStates, ", "))
+		}
+		if len(values) == 0 || slices.Contains(values, "") {
+			return fmt.Errorf("unknownWhen %q needs at least one value and no empty ones", name)
+		}
 	}
 	return nil
 }
@@ -174,6 +246,9 @@ func validateFailure(name string, c probe.Check) error {
 	case "", monitor.SeverityInfo, monitor.SeverityWarning, monitor.SeverityFatal:
 	default:
 		return fmt.Errorf("%s check: invalid failureSeverity %q", name, c.FailureSeverity)
+	}
+	if len(c.ReNotifyOnChange) > 0 && failureSeverity(c) == monitor.SeverityFatal {
+		return fmt.Errorf("%s check: reNotifyOnChange needs a Warning or Info check, because a Fatal check holds one condition for the whole episode", name)
 	}
 	return nil
 }
